@@ -222,6 +222,7 @@ def patch_uses_sdk_target(xml_tail: bytes, strings, target_index: int,
     tail = bytearray(xml_tail)
     uses_sdk_index = strings.index("uses-sdk")
     android_ns_index = strings.index(ANDROID_NS_URI)
+    patched = 0
     offset = 0
     while offset < len(tail):
         chunk_type, _, chunk_size = struct.unpack_from("<HHI", tail, offset)
@@ -231,9 +232,12 @@ def patch_uses_sdk_target(xml_tail: bytes, strings, target_index: int,
             if element_name == uses_sdk_index:
                 set_or_add_attr(tail, offset, android_ns_index, target_index,
                                 lambda attr: set_attr_int(attr, target_sdk))
-                return bytes(tail)
+                patched += 1
+                chunk_size = struct.unpack_from("<I", tail, offset + 4)[0]
         offset += chunk_size
-    raise ValueError("uses-sdk element not found in manifest")
+    if not patched:
+        raise ValueError("uses-sdk element not found in manifest")
+    return bytes(tail)
 
 
 def patch_application_debuggable(xml_tail: bytes, strings, debuggable_index: int,
@@ -404,7 +408,7 @@ def patch_manifest(axml: bytes, target_sdk: int, debuggable: bool,
     return axml[:4] + struct.pack("<I", total_size) + new_string_pool + resource_map + patched_tail
 
 
-def build_unsigned_apk(original_apk: Path, shim_so: Path, output_apk: Path,
+def build_unsigned_apk(original_apk: Path, shim_so: Path | None, output_apk: Path,
                        target_sdk: int, classes_dex: Path | None,
                        debuggable: bool, max_aspect_ratio: float) -> None:
     with zipfile.ZipFile(original_apk, "r") as source, zipfile.ZipFile(
@@ -422,12 +426,19 @@ def build_unsigned_apk(original_apk: Path, shim_so: Path, output_apk: Path,
                 target.writestr(info.filename, classes_dex.read_bytes())
                 continue
             if info.filename == "lib/armeabi/libpomegranate.so":
-                target.writestr("lib/armeabi-v7a/libpomegranate_orig.so",
-                                source.read(info.filename))
-                target.writestr("lib/armeabi-v7a/libpomegranate.so",
-                                shim_so.read_bytes())
+                if shim_so:
+                    target.writestr("lib/armeabi-v7a/libpomegranate_orig.so",
+                                    source.read(info.filename))
+                    target.writestr("lib/armeabi-v7a/libpomegranate.so",
+                                    shim_so.read_bytes())
+                else:
+                    target.writestr("lib/armeabi-v7a/libpomegranate.so",
+                                    source.read(info.filename))
                 continue
             if info.filename.startswith("lib/armeabi/"):
+                if not shim_so:
+                    target.writestr("lib/armeabi-v7a/" + Path(info.filename).name,
+                                    source.read(info.filename))
                 continue
             target.writestr(info, source.read(info.filename))
 
@@ -435,7 +446,8 @@ def build_unsigned_apk(original_apk: Path, shim_so: Path, output_apk: Path,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk", type=Path, required=True)
-    parser.add_argument("--shim", type=Path, required=True)
+    parser.add_argument("--shim", type=Path,
+                        help="replace libpomegranate.so with this loader shim")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--target-sdk", type=int, default=24)
     parser.add_argument("--classes-dex", type=Path,
