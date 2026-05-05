@@ -2,13 +2,16 @@
 
 MathStudio is the best Android math app I've used. It's a pity that it's unmaintained on Android since 2016. I've modernized the APK and now it should support Android >= 7 with armeabi-v7a. I've tested it on Android 13 and 14. It may show some incompatibility warnings, but it actually works.
 
+On some Android systems, you may need to manually grant storage permission.
+
 ## Files in this repo
 
 - `MathStudio_5.3_APKPure.apk`: original 5.3 APK obtained from APKPure.
 - `MathStudio_5.3_modern_signed.apk`: modernized 5.3 APK.
 - `MathStudioExpress_6.0.5_APK4Fun.apk`: original 6.0.5 APK obtained from APK4Fun.
 - `MathStudioExpress_6.0.5_modern_signed.apk`: modernized 6.0.5 APK.
-- `mathstudio_loader.c`: loader shim.
+- `mathstudio_loader.c`: loader shim for 5.3 .
+- `mathstudio_express_loader.c`: loader shim for 6.0.5 .
 - `patch_mathstudio_apk.py`: binary APK/manifest repack script.
 - `patch_smali_modern_storage.py`: smali patch script for 5.3 Java-side storage changes.
 - `patch_smali_express_modern_storage.py`: smali patch script for 6.0.5 Java-side storage changes.
@@ -16,10 +19,10 @@ MathStudio is the best Android math app I've used. It's a pity that it's unmaint
 ## What was patched
 
 1. Raised the app target SDK to 24.
-2. For MathStudio 5.3, replaced the native library entry with a loader shim. Preserved the original native library as `lib/armeabi-v7a/libpomegranate_orig.so`. Packaged the loader shim as `lib/armeabi-v7a/libpomegranate.so`.
-3. Patched native storage routing so the old native engine looks under the app-specific external files directory. Patched Java storage paths to use `getExternalFilesDir(null)` instead of broad `/sdcard/` storage.
-4. Added high-aspect-ratio manifest support so Android does not letterbox the app on tall screens.
-5. Re-packaged and signed the APK.
+2. Replaced the native library entry with a loader shim.
+3. Patched storage routing so `.math` / `.scripts` notebooks are saved to `/sdcard/Documents/MathStudio/`, and internal files are saved in `/sdcard/Android/`.
+4. Added high aspect ratio support.
+5. Repacked and signed the APK.
 
 ## Manifest patch
 
@@ -32,13 +35,9 @@ MathStudio is the best Android math app I've used. It's a pity that it's unmaint
 
 ## Loader shim
 
-The original MathStudio 5.3 `libpomegranate.so` is an armeabi-v7a library with text relocations. Android blocks text relocations for apps targeting API 23 or newer.
+The original MathStudio 5.3 `libpomegranate.so` is an armeabi-v7a library with text relocations. Android blocks text relocations for apps targeting API 23 or newer. The modernized app targets API 24, which is supported as of Android 17. The loader shim temporarily lowers the linker target SDK to 22 when loading the original library, then restores the linker target SDK to 24. The shim also registers the original JNI methods with `GameNative`, so Java continues calling the original engine functions.
 
-The modernized app targets API 24, which is supported as of Android 17. The loader shim temporarily lowers the linker target SDK to 22 when loading the original library. It then restores the linker target SDK to 24.
-
-The shim also registers the original JNI methods with `GameNative`, so Java continues calling the original engine functions.
-
-MathStudio Express 6.0.5 does not use this shim. Its inspected native library did not contain a `DT_TEXTREL` dynamic entry, and its Java code already calls native `GameNative.setStoragePath(...)`.
+MathStudio Express 6.0.5 uses a separate shim. Its native library did not contain text relocations, so this shim does not lower the linker target SDK. Instead, it loads the original library, registers the original JNI methods, and patches `Pomegranate::GetStoragePath(...)` in memory so the file picker root and `.math` / `.scripts` paths resolve under `/sdcard/Documents/MathStudio/`, while fonts and other resources stay under the app's internal files directory.
 
 ## Native storage patch
 
@@ -64,9 +63,10 @@ The MathStudio 5.3 Java code originally used `/sdcard/` and `GameNative.title()`
 
 The MathStudio Express 6.0.5 Java code already has native `setStoragePath(...)`, so it does not need the native-title shim trick. The 6.0.5 smali patch does the following:
 1. Adds `GameActivity.getStorageRoot()`.
-2. Implements it with `getExternalFilesDir(null).getAbsolutePath()`.
-3. Changes startup resource copying and `GameNative.setStoragePath(...)` to use the app-specific external files directory.
-4. Changes screenshots from `/sdcard/<title>/Screenshots` to the app-specific external files directory.
+2. Adds `GameActivity.getInternalStorageRoot()` and implements it with `getFilesDir().getAbsolutePath()`.
+3. Adds `GameActivity.getDocumentStorageRoot()` for `/sdcard/Documents/MathStudio/`.
+4. Copies bundled `.font` files to internal `Resources/`, and bundled `.math` / `.scripts` files to `/sdcard/Documents/MathStudio/`.
+5. Requests `WRITE_EXTERNAL_STORAGE` at runtime when needed.
 
 ## Aspect ratio patch
 
@@ -95,21 +95,21 @@ The commands below assume the required Android SDK build tools, Android NDK comp
    ```
 3. Reassemble the patched DEX:
    ```sh
-   java -jar smali.jar assemble smali_modern_storage -o classes_modern_storage_api.dex
+   java -jar smali.jar assemble smali_modern_storage -o classes_modern_storage.dex
    ```
-4. Build the native loader shim with Android NDK clang:
+4. Build the loader shim with Android NDK clang:
    ```sh
    clang --target=armv7a-linux-androideabi24 -shared -fPIC -O2 \
-     -o libpomegranate_shim_target24_storage.so \
+     -o libpomegranate_shim.so \
      mathstudio_loader.c \
      -llog -ldl
    ```
-5. Build an unsigned APK:
+5. Repack an unsigned APK:
    ```sh
    python patch_mathstudio_apk.py \
      --apk MathStudio_5.3_APKPure.apk \
-     --shim libpomegranate_shim_target24_storage.so \
-     --classes-dex classes_modern_storage_api.dex \
+     --shim libpomegranate_shim.so \
+     --classes-dex classes_modern_storage.dex \
      --out MathStudio_5.3_modern_unsigned.apk
    ```
 6. Align the APK:
@@ -145,20 +145,28 @@ The commands below assume the required Android SDK build tools, Android NDK comp
    ```sh
    java -jar smali.jar assemble smali_express_modern_storage -o classes_express_modern_storage.dex
    ```
-4. Build an unsigned APK:
+4. Build the loader shim with Android NDK clang:
+   ```sh
+   clang --target=armv7a-linux-androideabi24 -shared -fPIC -O2 \
+     -o libpomegranate_express_shim.so \
+     mathstudio_express_loader.c \
+     -llog -ldl
+   ```
+5. Repack an unsigned APK:
    ```sh
    python patch_mathstudio_apk.py \
      --apk MathStudioExpress_6.0.5_APK4Fun.apk \
+     --shim libpomegranate_express_shim.so \
      --classes-dex classes_express_modern_storage.dex \
      --out MathStudioExpress_6.0.5_modern_unsigned.apk
    ```
-5. Align the APK:
+6. Align the APK:
    ```sh
    zipalign -p -f 4 \
      MathStudioExpress_6.0.5_modern_unsigned.apk \
      MathStudioExpress_6.0.5_modern_aligned.apk
    ```
-6. Sign the APK:
+7. Sign the APK:
    ```sh
    apksigner sign \
      --ks <keystore> \
@@ -166,7 +174,7 @@ The commands below assume the required Android SDK build tools, Android NDK comp
      --out MathStudioExpress_6.0.5_modern_signed.apk \
      MathStudioExpress_6.0.5_modern_aligned.apk
    ```
-7. Verify the signature:
+8. Verify the signature:
    ```sh
    apksigner verify --verbose MathStudioExpress_6.0.5_modern_signed.apk
    ```
